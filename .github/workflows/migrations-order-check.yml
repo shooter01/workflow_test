@@ -1,1 +1,117 @@
+name: Migrations ordering check
+
+on:
+  pull_request:
+    paths:
+      - "migrations/**/*.sql"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate new migrations naming and version order
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          MIG_DIR = "migrations"
+
+          # Общий префикс: цифры до "_" (goose-версия)
+          prefix_pat = re.compile(r"^(?P<ver>\d+)_.+\.sql$")
+
+          # Ваш строгий формат для НОВЫХ миграций:
+          # Major(1-4 цифры) + Minor(2) + Hotfix(2) + YYYYMMDDhhmm(12) + _desc.sql
+          strict_new_pat = re.compile(
+              r"^(?P<major>\d{1,4})(?P<minor>\d{2})(?P<hf>\d{2})(?P<ts>\d{12})_.+\.sql$"
+          )
+
+          def fail(msg: str):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def git_ls(ref: str):
+              cmd = ["git", "ls-tree", "-r", "--name-only", ref, "--", MIG_DIR]
+              out = subprocess.check_output(cmd, text=True).splitlines()
+              return [p for p in out if p.endswith(".sql")]
+
+          def version_from_path(p: str):
+              name = os.path.basename(p)
+              m = prefix_pat.match(name)
+              if not m:
+                  return None
+              return int(m.group("ver"))
+
+          base_ref_name = os.environ.get("GITHUB_BASE_REF")
+          if not base_ref_name:
+              fail("This workflow is intended for pull_request events (GITHUB_BASE_REF is empty).")
+
+          # подтянем целевую ветку
+          subprocess.check_call(["git", "fetch", "origin", base_ref_name, "--depth=1"])
+          base_ref = f"origin/{base_ref_name}"
+
+          base_files = git_ls(base_ref)
+          head_files = git_ls("HEAD")
+
+          base_set, head_set = set(base_files), set(head_files)
+
+          # 1) запрет удаления/переименования (base файлы должны существовать в PR)
+          missing = sorted(base_set - head_set)
+          if missing:
+              fail("PR removes/renames existing migrations from base branch: " +
+                   ", ".join(missing[:20]) + ("..." if len(missing) > 20 else ""))
+
+          # 2) выделяем новые миграции
+          new_files = sorted(head_set - base_set)
+
+          # 3) проверка формата имён для новых миграций
+          bad = []
+          for p in new_files:
+              n = os.path.basename(p)
+              if not strict_new_pat.match(n):
+                  bad.append(n)
+          if bad:
+              fail("New migrations must match: <Major><Minor(2)><Hotfix(2)><YYYYMMDDhhmm>_desc.sql. Bad: " +
+                   ", ".join(bad[:20]) + ("..." if len(bad) > 20 else ""))
+
+          # 4) max версия в base
+          base_versions = []
+          for p in base_files:
+              v = version_from_path(p)
+              if v is None:
+                  fail(f"Base branch migration filename must start with digits then underscore: {os.path.basename(p)}")
+              base_versions.append(v)
+          base_max = max(base_versions) if base_versions else -1
+
+          # 5) дубликаты версий в PR ветке
+          seen = {}
+          for p in head_files:
+              v = version_from_path(p)
+              if v is None:
+                  fail(f"Migration filename must start with digits then underscore: {os.path.basename(p)}")
+              seen[v] = seen.get(v, 0) + 1
+          dups = [v for v, c in seen.items() if c > 1]
+          if dups:
+              fail("Duplicate migration versions in PR branch: " + ", ".join(map(str, sorted(dups)[:20])))
+
+          # 6) проверка порядка: новые версии строго больше max(base)
+          offenders = []
+          for p in new_files:
+              v = version_from_path(p)
+              if v is None:
+                  continue
+              if v <= base_max:
+                  offenders.append(f"{os.path.basename(p)} ({v})")
+
+          if offenders:
+              fail(f"New migration versions must be > max(base) ({base_max}). Offenders: " +
+                   ", ".join(offenders[:20]) + ("..." if len(offenders) > 20 else ""))
+
+          print(f"OK. base max={base_max}, new migrations={len(new_files)}")
+          PY
 
