@@ -8,4 +8,4 @@ jobs:
   echo:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "PR created!"
+      - run: echo "PR created!!"
