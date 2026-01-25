@@ -1,0 +1,11 @@
+name: Echo on PR open
+
+on:
+  pull_request:
+    types: [opened]
+
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PR created!"
