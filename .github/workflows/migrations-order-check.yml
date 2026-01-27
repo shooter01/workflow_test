@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Получить код репозитория (полная история)23
+      - name: Получить код репозитория (полная история)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -18,174 +18,140 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-          import os, re, subprocess, sys
+          import os
+          import re
+          import subprocess
+          import sys
 
-          MIG_DIR = "migrations"
+          MIGRATIONS_DIR = "migrations"
 
           # Общий префикс: цифры до "_" (goose-версия)
-          prefix_pat = re.compile(r"^(?P<ver>\d+)_.+\.sql$")
+          version_prefix_regex = re.compile(r"^(?P<version>\d+)_.+\.sql$")
 
-          # формат для миграций:
+          # Формат для миграций:
           # <YY><Major(1-3)><Minor(2)><Hotfix(2)><MM><DD><HH><mm><ss>_desc.sql
-          strict_new_pat = re.compile(
-            r"^(?P<yy>\d{2})(?P<major>\d{1,3})(?P<minor>\d{2})(?P<hf>\d{2})"
-            r"(?P<MM>(0[1-9]|1[0-2]))(?P<DD>(0[1-9]|[12]\d|3[01]))(?P<HH>([01]\d|2[0-3]))(?P<mm>([0-5]\d))(?P<ss>([0-5]\d))"
-            r"_.+\.sql$"
+          strict_new_name_regex = re.compile(
+              r"^(?P<yy>\d{2})(?P<major>\d{1,3})(?P<minor>\d{2})(?P<hf>\d{2})"
+              r"(?P<MM>(0[1-9]|1[0-2]))(?P<DD>(0[1-9]|[12]\d|3[01]))(?P<HH>([01]\d|2[0-3]))"
+              r"(?P<mm>([0-5]\d))(?P<ss>([0-5]\d))_.+\.sql$"
           )
 
-          def sh(cmd):
+          def run_and_capture(cmd):
               return subprocess.check_output(cmd, text=True).strip()
 
-          def fail(msg: str):
-              print(f"::error::{msg}")
+          def fail(message: str):
+              print(f"::error::{message}")
               sys.exit(1)
 
-          def git_ls(ref: str):
-              cmd = ["git", "ls-tree", "-r", "--name-only", ref, "--", MIG_DIR]
-              out = subprocess.check_output(cmd, text=True).splitlines()
-              return [p for p in out if p.endswith(".sql")]
+          def list_sql_migrations(git_ref: str):
+              cmd = ["git", "ls-tree", "-r", "--name-only", git_ref, "--", MIGRATIONS_DIR]
+              paths = subprocess.check_output(cmd, text=True).splitlines()
+              return [path for path in paths if path.endswith(".sql")]
 
-          def version_from_path(p: str):
-              name = os.path.basename(p)
-              m = prefix_pat.match(name)
-              if not m:
+          def parse_goose_version(file_path: str):
+              migration_name = os.path.basename(file_path)
+              match = version_prefix_regex.match(migration_name)
+              if not match:
                   return None
-              return int(m.group("ver"))
+              return int(match.group("version"))
 
-          # ---- DIAGNOSTICS: общая инфа про ран ----
-          print("=== DIAG: GitHub context ===")
-          print("GITHUB_EVENT_NAME:", os.environ.get("GITHUB_EVENT_NAME"))
-          print("GITHUB_REF:", os.environ.get("GITHUB_REF"))
-          print("GITHUB_HEAD_REF:", os.environ.get("GITHUB_HEAD_REF"))
-          print("GITHUB_BASE_REF:", os.environ.get("GITHUB_BASE_REF"))
-          print("GITHUB_SHA:", os.environ.get("GITHUB_SHA"))
-
-          print("\n=== DIAG: repo state ===")
-          print("HEAD commit:", sh(["git", "rev-parse", "HEAD"]))
-          try:
-              print("HEAD branch:", sh(["git", "rev-parse", "--abbrev-ref", "HEAD"]))
-          except Exception:
-              pass
-
-          base_ref_name = os.environ.get("GITHUB_BASE_REF")
-          if not base_ref_name:
+          base_branch_name = os.environ.get("GITHUB_BASE_REF")
+          if not base_branch_name:
               fail("Этот workflow предназначен для событий pull_request (GITHUB_BASE_REF пуст).")
 
-          # Подтягиваем целевую ветку
-          subprocess.check_call(["git", "fetch", "origin", base_ref_name, "--depth=1"])
-          base_ref = f"origin/{base_ref_name}"
+          # Подтягиваем целевую ветку, чтобы сравнивать содержимое migrations между base и PR
+          subprocess.check_call(["git", "fetch", "origin", base_branch_name, "--depth=1"])
+          base_ref = f"origin/{base_branch_name}"
 
-          print("\n=== DIAG: base/head refs ===")
-          print("base_ref:", base_ref, "->", sh(["git", "rev-parse", base_ref]))
-          print("head_ref(HEAD):", sh(["git", "rev-parse", "HEAD"]))
+          head_sha = run_and_capture(["git", "rev-parse", "HEAD"])
+          base_sha = run_and_capture(["git", "rev-parse", base_ref])
+          print(f"DIAG: base_ref={base_ref} ({base_sha}), head={head_sha}")
 
-          base_files = git_ls(base_ref)
-          head_files = git_ls("HEAD")
+          base_migrations = list_sql_migrations(base_ref)
+          head_migrations = list_sql_migrations("HEAD")
 
-          print("\n=== DIAG: files counts ===")
-          print("base_files:", len(base_files))
-          print("head_files:", len(head_files))
+          base_set = set(base_migrations)
+          head_set = set(head_migrations)
 
-          base_set, head_set = set(base_files), set(head_files)
+          # Запрет удаления/переименования
+          missing_in_pr = sorted(base_set - head_set)
+          if missing_in_pr:
+              fail(
+                  "PR удаляет/переименовывает существующие миграции из целевой ветки: " +
+                  ", ".join(missing_in_pr[:20]) + ("..." if len(missing_in_pr) > 20 else "")
+              )
 
-          # Запрет удаления/переименования (файлы из base должны существовать в PR)
-          missing = sorted(base_set - head_set)
-          print("\n=== DIAG: missing (base - head) ===")
-          print("missing_count:", len(missing))
-          if len(missing) > 0:
-              print("missing_sample:", missing[:20])
-
-          if missing:
-              fail("PR удаляет/переименовывает существующие миграции из целевой ветки: " +
-                   ", ".join(missing[:20]) + ("..." if len(missing) > 20 else ""))
-
-          # Выделяем новые миграции
-          new_files = sorted(head_set - base_set)
-          print("\n=== DIAG: new_files (head - base) ===")
-          print("new_files_count:", len(new_files))
-          if len(new_files) > 0:
-              print("new_files_sample:", new_files[:50])
-
-          # ---- DIAGNOSTICS: max(base) и top версий ----
-          def collect_versions(files, label):
-              vs = []
-              bad = []
-              for p in files:
-                  v = version_from_path(p)
-                  if v is None:
-                      bad.append(os.path.basename(p))
-                  else:
-                      vs.append((v, os.path.basename(p)))
-              vs.sort(key=lambda x: x[0])
-              print(f"\n=== DIAG: versions in {label} ===")
-              print("bad_prefix_count:", len(bad))
-              if bad:
-                  print("bad_prefix_sample:", bad[:10])
-              print("min_version:", vs[0][0] if vs else None)
-              print("max_version:", vs[-1][0] if vs else None)
-              print("top5_max:")
-              for v, n in reversed(vs[-5:]):
-                  print(" ", v, n)
-              return vs, bad
-
-          base_vs, base_bad = collect_versions(base_files, "base")
-          head_vs, head_bad = collect_versions(head_files, "head")
-
-          if base_bad:
-              fail("Имя файла миграции в целевой ветке должно начинаться с цифр и затем содержать подчёркивание: " + ", ".join(base_bad[:10]))
+          # Новые миграции — те, что есть в PR, но нет в base
+          new_migrations = sorted(head_set - base_set)
+          if new_migrations:
+              print("DIAG: new_files:")
+              for file_path in new_migrations[:100]:
+                  print(" -", os.path.basename(file_path))
 
           # Максимальная версия в base
-          base_max = base_vs[-1][0] if base_vs else -1
-          print("\n=== DIAG: base_max ===")
-          print("base_max:", base_max)
+          base_versions = []
+          invalid_base_names = []
+          for file_path in base_migrations:
+              version = parse_goose_version(file_path)
+              if version is None:
+                  invalid_base_names.append(os.path.basename(file_path))
+              else:
+                  base_versions.append(version)
 
-          # ---- Проверка формата имён для новых миграций ----
-          bad = []
-          print("\n=== DIAG: strict format check for new_files ===")
-          for p in new_files:
-              n = os.path.basename(p)
+          if invalid_base_names:
+              fail(
+                  "Имя файла миграции в целевой ветке должно начинаться с цифр и затем содержать подчёркивание: " +
+                  ", ".join(invalid_base_names[:10]) + ("..." if len(invalid_base_names) > 10 else "")
+              )
 
-              m_prefix = prefix_pat.match(n)
-              v = int(m_prefix.group("ver")) if m_prefix else None
+          base_max_version = max(base_versions) if base_versions else -1
+          print(f"DIAG: base_max={base_max_version}")
 
-              ok = strict_new_pat.match(n) is not None
-              print(f" - {n} | version={v} | strict_ok={ok}")
+          # Проверка формата имён для новых миграций
+          bad_new_names = []
+          for file_path in new_migrations:
+              migration_name = os.path.basename(file_path)
+              if not strict_new_name_regex.match(migration_name):
+                  bad_new_names.append(migration_name)
 
-              if not ok:
-                  bad.append(n)
+          if bad_new_names:
+              fail(
+                  "Новые миграции должны соответствовать формату: <YY><Major(1-3)><Minor(2)><Hotfix(2)><MM><DD><HH><mm><ss>_desc.sql. Ошибки: " +
+                  ", ".join(bad_new_names[:20]) + ("..." if len(bad_new_names) > 20 else "")
+              )
 
-          if bad:
-              fail("Новые миграции должны соответствовать формату: <YY><Major(1-3)><Minor(2)><Hotfix(2)><MM><DD><HH><mm><ss>_desc.sql. Ошибки: " +
-                   ", ".join(bad[:20]) + ("..." if len(bad) > 20 else ""))
+          # Дубликаты версий в PR-ветке
+          version_counts = {}
+          for file_path in head_migrations:
+              version = parse_goose_version(file_path)
+              if version is None:
+                  fail(
+                      "Имя файла миграции должно начинаться с цифр и затем содержать подчёркивание: " +
+                      os.path.basename(file_path)
+                  )
+              version_counts[version] = version_counts.get(version, 0) + 1
 
-          # ---- Дубликаты версий в PR-ветке ----
-          seen = {}
-          for p in head_files:
-              v = version_from_path(p)
-              if v is None:
-                  fail(f"Имя файла миграции должно начинаться с цифр и затем содержать подчёркивание: {os.path.basename(p)}")
-              seen[v] = seen.get(v, 0) + 1
-          dups = [v for v, c in seen.items() if c > 1]
-          print("\n=== DIAG: duplicates ===")
-          print("dups_count:", len(dups))
-          if dups:
-              print("dups_sample:", sorted(dups)[:20])
-              fail("Найдены дубликаты версий миграций в PR-ветке: " + ", ".join(map(str, sorted(dups)[:20])))
+          duplicate_versions = [v for v, count in version_counts.items() if count > 1]
+          if duplicate_versions:
+              fail(
+                  "Найдены дубликаты версий миграций в PR-ветке: " +
+                  ", ".join(map(str, sorted(duplicate_versions)[:20]))
+              )
 
-          # ---- Проверка порядка: новые версии строго больше max(base) ----
-          offenders = []
-          print("\n=== DIAG: order check (new > base_max) ===")
-          for p in new_files:
-              v = version_from_path(p)
-              if v is None:
+          # Проверка порядка: версия каждой новой миграции должна быть строго больше max(base)
+          order_offenders = []
+          for file_path in new_migrations:
+              version = parse_goose_version(file_path)
+              if version is None:
                   continue
-              if v <= base_max:
-                  offenders.append(f"{os.path.basename(p)} ({v})")
-                  print(" OFFENDER:", os.path.basename(p), v, "<= base_max", base_max)
+              if version <= base_max_version:
+                  order_offenders.append(f"{os.path.basename(file_path)} ({version})")
 
-          if offenders:
-              fail(f"Версии новых миграций должны быть > max(base) ({base_max}). Нарушители: " +
-                   ", ".join(offenders[:20]) + ("..." if len(offenders) > 20 else ""))
+          if order_offenders:
+              fail(
+                  f"Версии новых миграций должны быть > max(base) ({base_max_version}). Нарушители: " +
+                  ", ".join(order_offenders[:20]) + ("..." if len(order_offenders) > 20 else "")
+              )
 
-          print(f"\nOK. max(base)={base_max}, новых миграций={len(new_files)}")
+          print(f"OK. max(base)={base_max_version}, новых миграций={len(new_migrations)}")
           PY
