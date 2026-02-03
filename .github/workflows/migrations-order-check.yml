@@ -28,12 +28,26 @@ jobs:
 
           git fetch origin "$BASE_SHA" --depth=1
 
-          # Берём только добавленные файлы (A) и только SQL внутри migrations/
-          if git diff --name-status "$BASE_SHA..$HEAD_SHA" | awk '$1=="A"{print $2}' | grep -E '^migrations/.*\.sql$' >/dev/null; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+          run="$(git diff --name-status "$BASE_SHA..$HEAD_SHA" | python3 - <<'PY'
+import sys
+
+BAD = "\u200e\u200f\ufeff\u200b"  # частые невидимые символы в конце
+
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) < 2:
+        continue
+    status = parts[0]
+    path = parts[1].rstrip(BAD)
+
+    if status == "A" and path.startswith("migrations/") and path.endswith(".sql"):
+        print("true")
+        raise SystemExit(0)
+
+print("false")
+PY
+)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
 
       - name: Пропуск (если новых SQL-миграций нет)
         if: steps.mig.outputs.run != 'true'
@@ -42,109 +56,33 @@ jobs:
       - name: Проверить формат имён новых миграций
         if: steps.mig.outputs.run == 'true'
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          set -euo pipefail
+          git fetch origin "$BASE_SHA" --depth=1
+
           python3 - <<'PY'
-          import os
-          import re
-          import subprocess
-          import sys
+import os
+import re
+import subprocess
+import sys
 
-          # Новый строгий формат (18 цифр до "_"):
-          # <YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM(01-12)><DD><HH><mm><ss>_desc.sql
-          strict_name_regex = re.compile(
-              r"^(?P<yy>\d{2})"
-              r"(?P<major>(0[1-9]|1[0-2]))"
-              r"(?P<minor>\d{2})"
-              r"(?P<hf>\d{2})"
-              r"(?P<MM>(0[1-9]|1[0-2]))"
-              r"(?P<DD>(0[1-9]|[12]\d|3[01]))"
-              r"(?P<HH>([01]\d|2[0-3]))"
-              r"(?P<mm>([0-5]\d))"
-              r"(?P<ss>([0-5]\d))"
-              r"_.+\.sql$"
-          )
+BASE_SHA = os.environ["BASE_SHA"]
+HEAD_SHA = os.environ["HEAD_SHA"]
 
-          def fail(message: str):
-              print(f"::error::{message}")
-              sys.exit(1)
+BAD = "\u200e\u200f\ufeff\u200b"
 
-          base_sha = os.environ.get("GITHUB_BASE_SHA") or os.environ.get("GITHUB_EVENT_PULL_REQUEST_BASE_SHA")
-          head_sha = os.environ.get("GITHUB_SHA")
-
-          # Надёжнее взять SHA напрямую из git
-          base_sha = subprocess.check_output(
-              ["git", "rev-parse", "FETCH_HEAD"], text=True
-          ).strip() if base_sha is None else base_sha
-
-          # Но мы уже fetch'или base в bash, поэтому просто найдём base через merge-base не надо.
-          # Возьмём base из env, если нет — упадём с понятным сообщением.
-          base_sha = os.environ.get("GITHUB_BASE_SHA", "").strip()
-          if not base_sha:
-              # fallback: возьмём из контекста Actions через git show (обычно не нужно, но пусть будет)
-              # если не выйдет — попросим запустить через PR event (это и есть наш кейс)
-              pass
-
-          # Проще и надёжнее: берём SHA из переменных окружения, которые нам передал workflow через bash
-          # Поэтому тут читаем их из git напрямую:
-          # base — это коммит, на который сделали fetch origin <BASE_SHA> --depth=1
-          # В checkout у нас HEAD = PR head sha
-          head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-
-          # base_sha достанем из git по ссылке "FETCH_HEAD" (последний fetch в шаге bash был base_sha)
-          # Но тут другой step, fetch уже не гарантирован как "последний".
-          # Поэтому сделаем fetch ещё раз из base-ref безопасно (дёшево).
-          base_ref = os.environ.get("GITHUB_BASE_REF")
-          if not base_ref:
-              fail("Этот workflow предназначен для событий pull_request (GITHUB_BASE_REF пуст).")
-          subprocess.check_call(["git", "fetch", "origin", base_ref, "--depth=1"])
-          base_sha = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], text=True).strip()
-
-          # Список ТОЛЬКО добавленных sql-файлов в migrations/
-          diff = subprocess.check_output(["git", "diff", "--name-status", f"{base_sha}..{head_sha}"], text=True).splitlines()
-          added_sql = []
-          for line in diff:
-              parts = line.split("\t", 1)
-              if len(parts) != 2:
-                  continue
-              status, path = parts
-              if status == "A" and path.startswith("migrations/") and path.endswith(".sql"):
-                  added_sql.append(path)
-
-          if not added_sql:
-              print("OK")
-              return
-
-          bad = []
-          for p in added_sql:
-              name = os.path.basename(p)
-              if not strict_name_regex.match(name):
-                  bad.append(name)
-
-          if bad:
-              fail(
-                  "Новые миграции должны соответствовать формату: "
-                  "<YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM><DD><HH><mm><ss>_desc.sql. Ошибки: " +
-                  ", ".join(bad[:20]) + ("..." if len(bad) > 20 else "")
-              )
-
-          # Проверка на дубликаты префикса (цифры до '_') среди ДОБАВЛЕННЫХ в PR
-          prefix_re = re.compile(r"^(\d+)_")
-          prefixes = {}
-          for p in added_sql:
-              name = os.path.basename(p)
-              m = prefix_re.match(name)
-              if not m:
-                  # сюда не должны попасть из-за strict regex, но оставим на всякий
-                  continue
-              pref = m.group(1)
-              prefixes[pref] = prefixes.get(pref, 0) + 1
-
-          dups = [pref for pref, c in prefixes.items() if c > 1]
-          if dups:
-              fail(
-                  "Найдены дубликаты версий среди новых миграций в PR (одинаковые цифры до '_'): " +
-                  ", ".join(sorted(dups)[:20])
-              )
-
-          print("OK")
-          PY
+# Новый строгий формат (18 цифр до "_"):
+# <YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM(01-12)><DD><HH><mm><ss>_desc.sql
+strict_name_regex = re.compile(
+    r"^(?P<yy>\d{2})"
+    r"(?P<major>(0[1-9]|1[0-2]))"
+    r"(?P<minor>\d{2})"
+    r"(?P<hf>\d{2})"
+    r"(?P<MM>(0[1-9]|1[0-2]))"
+    r"(?P<DD>(0[1-9]|[12]\d|3[01]))"
+    r"(?P<HH>([01]\d|2[0-3]))"
+    r"(?P<mm>([0-5]\d))"
+    r"(
