@@ -28,8 +28,7 @@ jobs:
           git fetch origin "$BASE_SHA" --depth=1
 
           python3 - <<'PY'
-          import os
-          import subprocess
+          import os, subprocess
 
           base = os.environ["BASE_SHA"]
           head = os.environ["HEAD_SHA"]
@@ -56,7 +55,7 @@ jobs:
         if: steps.mig.outputs.run != 'true'
         run: echo "Новых SQL-миграций нет — проверка не требуется."
 
-      - name: Проверить формат имён новых миграций
+      - name: Проверить формат и порядок новых миграций
         if: steps.mig.outputs.run == 'true'
         shell: bash
         env:
@@ -94,6 +93,18 @@ jobs:
               print(f"::error::{msg}")
               sys.exit(1)
 
+          def version_from_name(name: str):
+              m = strict_name_regex.match(name)
+              if not m:
+                  return None, None
+              # Версия = цифры до "_"
+              v = int(name.split("_", 1)[0])
+              # Раз major = месяц — требуем совпадения major и MM
+              if m.group("major") != m.group("MM"):
+                  return v, f"major={m.group('major')} != MM={m.group('MM')}"
+              return v, None
+
+          # 1) список ДОБАВЛЕННЫХ sql в migrations/ в PR
           diff = subprocess.check_output(
               ["git", "diff", "--name-status", f"{base}..{head}"],
               text=True
@@ -111,25 +122,48 @@ jobs:
               print("OK")
               sys.exit(0)
 
+          # 2) базовые версии (НЕ валидируем base по формату — просто берем те, что совпадают)
+          base_paths = subprocess.check_output(
+              ["git", "ls-tree", "-r", "--name-only", base, "--", "migrations"],
+              text=True
+          ).splitlines()
+
+          base_versions = set()
+          base_max = -1
+          for p in base_paths:
+              if not p.endswith(".sql"):
+                  continue
+              name = os.path.basename(p)
+              v, _ = version_from_name(name)
+              if v is None:
+                  continue  # legacy/прочее в base игнорируем, не падаем
+              base_versions.add(v)
+              if v > base_max:
+                  base_max = v
+
+          # 3) проверяем имена новых + дубликаты среди новых + порядок относительно base_max
           bad = []
           month_mismatch = []
           prefixes = {}
+          offenders = []
 
           for path in added_sql:
               name = os.path.basename(path)
 
-              m = strict_name_regex.match(name)
-              if not m:
+              v, mismatch = version_from_name(name)
+              if v is None:
                   bad.append(name)
                   continue
+              if mismatch:
+                  month_mismatch.append(f"{name} ({mismatch})")
 
-              # Раз major = месяц — требуем совпадения major и MM
-              if m.group("major") != m.group("MM"):
-                  month_mismatch.append(f"{name} (major={m.group('major')}, MM={m.group('MM')})")
-
-              # Дубликаты среди новых: одинаковые цифры до "_"
               pref = name.split("_", 1)[0]
               prefixes[pref] = prefixes.get(pref, 0) + 1
+
+              if v in base_versions:
+                  offenders.append(f"{name} (версия уже существует в целевой ветке)")
+              if base_max != -1 and v <= base_max:
+                  offenders.append(f"{name} (версия {v} <= max(base) {base_max})")
 
           if bad:
               fail(
@@ -149,6 +183,12 @@ jobs:
               fail(
                   "Найдены дубликаты версий среди новых миграций в PR (одинаковые цифры до '_'): " +
                   ", ".join(sorted(dups)[:20])
+              )
+
+          if offenders:
+              fail(
+                  "Новые миграции должны иметь версию строго больше существующих в целевой ветке. Нарушители: " +
+                  ", ".join(offenders[:20]) + ("..." if len(offenders) > 20 else "")
               )
 
           print("OK")
