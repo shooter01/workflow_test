@@ -20,34 +20,37 @@ jobs:
       - name: Определить, есть ли новые SQL-миграции
         id: mig
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
           git fetch origin "$BASE_SHA" --depth=1
 
-          run="$(git diff --name-status "$BASE_SHA..$HEAD_SHA" | python3 - <<'PY'
-import sys
+          python3 - <<'PY'
+          import os
+          import subprocess
 
-BAD = "\u200e\u200f\ufeff\u200b"  # частые невидимые символы в конце
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
 
-for line in sys.stdin:
-    parts = line.rstrip("\n").split("\t")
-    if len(parts) < 2:
-        continue
-    status = parts[0]
-    path = parts[1].rstrip(BAD)
+          diff = subprocess.check_output(
+              ["git", "diff", "--name-status", f"{base}..{head}"],
+              text=True
+          ).splitlines()
 
-    if status == "A" and path.startswith("migrations/") and path.endswith(".sql"):
-        print("true")
-        raise SystemExit(0)
+          run = False
+          for line in diff:
+              parts = line.split("\t")
+              if len(parts) >= 2 and parts[0] == "A":
+                  path = parts[1].rstrip()
+                  if path.startswith("migrations/") and path.endswith(".sql"):
+                      run = True
+                      break
 
-print("false")
-PY
-)"
-          echo "run=$run" >> "$GITHUB_OUTPUT"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"run={'true' if run else 'false'}\n")
+          PY
 
       - name: Пропуск (если новых SQL-миграций нет)
         if: steps.mig.outputs.run != 'true'
@@ -64,25 +67,89 @@ PY
           git fetch origin "$BASE_SHA" --depth=1
 
           python3 - <<'PY'
-import os
-import re
-import subprocess
-import sys
+          import os
+          import re
+          import subprocess
+          import sys
 
-BASE_SHA = os.environ["BASE_SHA"]
-HEAD_SHA = os.environ["HEAD_SHA"]
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
 
-BAD = "\u200e\u200f\ufeff\u200b"
+          # Новый строгий формат (18 цифр до "_"):
+          # <YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM(01-12)><DD><HH><mm><ss>_desc.sql
+          strict_name_regex = re.compile(
+              r"^(?P<yy>\d{2})"
+              r"(?P<major>(0[1-9]|1[0-2]))"
+              r"(?P<minor>\d{2})"
+              r"(?P<hf>\d{2})"
+              r"(?P<MM>(0[1-9]|1[0-2]))"
+              r"(?P<DD>(0[1-9]|[12]\d|3[01]))"
+              r"(?P<HH>([01]\d|2[0-3]))"
+              r"(?P<mm>([0-5]\d))"
+              r"(?P<ss>([0-5]\d))"
+              r"_.+\.sql$"
+          )
 
-# Новый строгий формат (18 цифр до "_"):
-# <YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM(01-12)><DD><HH><mm><ss>_desc.sql
-strict_name_regex = re.compile(
-    r"^(?P<yy>\d{2})"
-    r"(?P<major>(0[1-9]|1[0-2]))"
-    r"(?P<minor>\d{2})"
-    r"(?P<hf>\d{2})"
-    r"(?P<MM>(0[1-9]|1[0-2]))"
-    r"(?P<DD>(0[1-9]|[12]\d|3[01]))"
-    r"(?P<HH>([01]\d|2[0-3]))"
-    r"(?P<mm>([0-5]\d))"
-    r"(
+          def fail(msg: str):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          diff = subprocess.check_output(
+              ["git", "diff", "--name-status", f"{base}..{head}"],
+              text=True
+          ).splitlines()
+
+          added_sql = []
+          for line in diff:
+              parts = line.split("\t")
+              if len(parts) >= 2 and parts[0] == "A":
+                  path = parts[1].rstrip()
+                  if path.startswith("migrations/") and path.endswith(".sql"):
+                      added_sql.append(path)
+
+          if not added_sql:
+              print("OK")
+              sys.exit(0)
+
+          bad = []
+          month_mismatch = []
+          prefixes = {}
+
+          for path in added_sql:
+              name = os.path.basename(path)
+
+              m = strict_name_regex.match(name)
+              if not m:
+                  bad.append(name)
+                  continue
+
+              # Раз major = месяц — требуем совпадения major и MM
+              if m.group("major") != m.group("MM"):
+                  month_mismatch.append(f"{name} (major={m.group('major')}, MM={m.group('MM')})")
+
+              # Дубликаты среди новых: одинаковые цифры до "_"
+              pref = name.split("_", 1)[0]
+              prefixes[pref] = prefixes.get(pref, 0) + 1
+
+          if bad:
+              fail(
+                  "Новые миграции должны соответствовать формату: "
+                  "<YY><Major(месяц 01-12)><Minor(2)><Hotfix(2)><MM><DD><HH><mm><ss>_desc.sql. Ошибки: " +
+                  ", ".join(bad[:20]) + ("..." if len(bad) > 20 else "")
+              )
+
+          if month_mismatch:
+              fail(
+                  "В новых миграциях поле Major(месяц) должно совпадать с MM. Ошибки: " +
+                  ", ".join(month_mismatch[:20]) + ("..." if len(month_mismatch) > 20 else "")
+              )
+
+          dups = [p for p, c in prefixes.items() if c > 1]
+          if dups:
+              fail(
+                  "Найдены дубликаты версий среди новых миграций в PR (одинаковые цифры до '_'): " +
+                  ", ".join(sorted(dups)[:20])
+              )
+
+          print("OK")
+          PY
