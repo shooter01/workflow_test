@@ -1,183 +1,169 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== AI PR Review Action =="
+echo "== Qwen PR Review Action =="
+
+echo "Repository: ${INPUT_REPOSITORY}"
+echo "PR number: ${INPUT_PR_NUMBER}"
+echo "Base ref: ${INPUT_BASE_REF}"
+echo "Head ref: ${INPUT_HEAD_REF}"
 echo "Diff file: ${INPUT_DIFF_FILE}"
+echo "Changed files file: ${INPUT_CHANGED_FILES_FILE}"
 echo "Output file: ${INPUT_OUTPUT_FILE}"
-echo "Run tests: ${INPUT_RUN_TESTS}"
+echo "Run Go checks: ${INPUT_RUN_GO_CHECKS}"
 echo "Post comment: ${INPUT_POST_COMMENT}"
+
+if [ -z "${YANDEX_API_KEY:-}" ]; then
+  echo "YANDEX_API_KEY is required. Add it to GitHub Secrets and pass it via env." >&2
+  exit 1
+fi
 
 if [ ! -f "${INPUT_DIFF_FILE}" ]; then
   echo "Diff file not found: ${INPUT_DIFF_FILE}" >&2
   exit 1
 fi
 
-echo "== Install dependencies =="
-sudo apt-get update -y
-sudo apt-get install -y jq
-
-echo "== Install Qwen Code CLI =="
-npm install --silent --no-audit --global "@qwen-code/qwen-code@${INPUT_QWEN_CLI_VERSION}"
-
-echo "== Qwen version =="
-qwen --version || true
-
 mkdir -p "$(dirname "${INPUT_OUTPUT_FILE}")"
+mkdir -p .qwen
 
-TEST_RESULT_FILE="test-result.txt"
-PROMPT_FILE="ai-review-prompt.txt"
-QWEN_JSON_FILE="qwen-output.json"
-QWEN_ERR_FILE="qwen-error.log"
+echo "== Create Qwen settings =="
 
-if [ "${INPUT_RUN_TESTS}" = "true" ]; then
-  echo "== Running tests =="
-  set +e
-  go test ./... > "${TEST_RESULT_FILE}" 2>&1
-  TEST_EXIT_CODE=$?
-  set -e
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
 
-  echo "Tests exit code: ${TEST_EXIT_CODE}"
-else
-  TEST_EXIT_CODE=0
-  echo "Tests were not executed." > "${TEST_RESULT_FILE}"
-fi
+model_id = os.environ["INPUT_MODEL_ID"]
+base_url = os.environ["INPUT_BASE_URL"]
 
-DEFAULT_PROMPT='Ты AI code review agent.
+settings = {
+    "modelProviders": {
+        "openai": [
+            {
+                "id": model_id,
+                "name": "Qwen3 235B (Yandex AI Studio)",
+                "envKey": "YANDEX_API_KEY",
+                "baseUrl": base_url,
+                "generationConfig": {
+                    "timeout": 120000,
+                    "maxRetries": 2,
+                    "contextWindowSize": 128000,
+                    "samplingParams": {
+                        "temperature": 0.3,
+                        "max_tokens": 8192,
+                    },
+                },
+            }
+        ]
+    },
+    "$version": 3,
+    "model": {
+        "name": model_id,
+    },
+    "security": {
+        "auth": {
+            "selectedType": "openai",
+        },
+    },
+}
 
-Проанализируй PR diff.
-Найди только реальные проблемы:
-- баги;
-- проблемы безопасности;
-- ошибки обработки ошибок;
-- race condition;
-- проблемы совместимости API;
-- проблемы с тестами;
-- плохую обработку edge cases.
+Path(".qwen/settings.json").write_text(
+    json.dumps(settings, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+PY
 
-Не придумывай замечания.
-Если серьёзных проблем нет, так и напиши.
+echo "== Build Qwen prompt =="
 
-Ответ дай в Markdown:
+python3 - <<'PY'
+import os
+from pathlib import Path
 
-## AI Review
+repository = os.environ.get("INPUT_REPOSITORY", "")
+pr_number = os.environ.get("INPUT_PR_NUMBER", "")
+base_ref = os.environ.get("INPUT_BASE_REF", "")
+head_ref = os.environ.get("INPUT_HEAD_REF", "")
+diff_file = os.environ["INPUT_DIFF_FILE"]
+changed_files_file = os.environ.get("INPUT_CHANGED_FILES_FILE", "")
+run_go_checks = os.environ.get("INPUT_RUN_GO_CHECKS", "true")
+extra_prompt = os.environ.get("INPUT_EXTRA_PROMPT", "").strip()
 
-### Summary
+diff = Path(diff_file).read_text(encoding="utf-8", errors="replace")
 
-### Findings
+if changed_files_file and Path(changed_files_file).exists():
+    changed_files = Path(changed_files_file).read_text(encoding="utf-8", errors="replace")
+else:
+    changed_files = "changed-files.txt not found."
 
-Для каждого замечания:
-- severity: critical/high/medium/low
-- file
-- line, если понятно
-- problem
-- suggestion
-'
+go_checks_text = """
+6. Запусти проверки:
+   - go test ./...
+   - go vet ./...
+   Если команда не может быть выполнена, объясни почему.
+7. Сравни вывод CLI-команд с анализом diff.
+""" if run_go_checks == "true" else """
+6. Go-проверки не запускай, если явно не нужно для анализа.
+"""
 
-if [ -n "${INPUT_PROMPT}" ]; then
-  REVIEW_PROMPT="${INPUT_PROMPT}"
-else
-  REVIEW_PROMPT="${DEFAULT_PROMPT}"
-fi
+prompt = f"""Ты — строгий, но прагматичный Go code reviewer.
 
-cat > "${PROMPT_FILE}" <<EOF
-${REVIEW_PROMPT}
+Проверь Pull Request.
 
----
+Repository: {repository}
+PR: #{pr_number}
+Base branch: {base_ref}
+Head branch: {head_ref}
 
-PR diff:
+Ниже дан diff текущей ветки PR относительно целевой ветки PR.
+Но НЕ ограничивайся только diff.
 
-\`\`\`diff
-$(cat "${INPUT_DIFF_FILE}")
-\`\`\`
+Обязательно используй доступные CLI tools, чтобы проверить изменения в контексте репозитория:
 
----
+1. Посмотри структуру проекта.
+2. Прочитай go.mod, если это Go-проект.
+3. Прочитай изменённые файлы из diff.
+4. Прочитай связанные файлы, которые импортируются или используются изменённым кодом.
+5. Найди определения вызываемых функций и типов.
+{go_checks_text}
 
-Test result:
+Важно:
+- Не изменяй файлы.
+- Не делай commit.
+- Не делай push.
+- Не исправляй код автоматически.
+- Твоя задача — только review.
+- Не выдумывай проблемы, которых нет.
+- Если проблема подтверждается компиляцией или CLI-командой, явно напиши это.
+- Если PR не компилируется, итоговый риск должен быть high.
+- Если есть несколько compile errors, объедини их в одну группу "Код не компилируется".
+- В разделе "Что проверил через CLI" не перечисляй внутренние tool names вроде read_file, grep_search, list_directory.
+- Пиши человечески: "прочитал go.mod", "запустил go test ./...", "проверил import path".
 
-\`\`\`
-$(cat "${TEST_RESULT_FILE}")
-\`\`\`
-EOF
+{extra_prompt}
 
-echo "== Prompt size =="
-wc -c "${PROMPT_FILE}" || true
+Ответь по-русски в формате:
 
-echo "== Run Qwen Code =="
+## Краткое резюме
 
-export OPENAI_API_KEY="${INPUT_OPENAI_API_KEY}"
-export OPENAI_BASE_URL="${INPUT_OPENAI_BASE_URL}"
-export OPENAI_MODEL="${INPUT_OPENAI_MODEL}"
-export QWEN_CODE_UNATTENDED_RETRY=1
-export SURFACE="GitHub"
+## Что проверил через CLI
 
-set +e
-qwen \
-  --yolo \
-  --prompt "$(cat "${PROMPT_FILE}")" \
-  --channel=CI \
-  --output-format json \
-  > "${QWEN_JSON_FILE}" \
-  2> "${QWEN_ERR_FILE}"
+## Найденные проблемы
 
-QWEN_EXIT_CODE=$?
-set -e
+Для каждой проблемы укажи:
+- severity: low / medium / high
+- file: путь к файлу
+- line: примерная строка, если понятно
+- issue: что не так
+- evidence: чем подтверждается
+- recommendation: что исправить
 
-if [ "${QWEN_EXIT_CODE}" -ne 0 ]; then
-  echo "Qwen failed with exit code ${QWEN_EXIT_CODE}" >&2
-  echo "== stderr =="
-  cat "${QWEN_ERR_FILE}" || true
-  exit "${QWEN_EXIT_CODE}"
-fi
+## Что проверить тестами
 
-echo "== Parse Qwen output =="
+## Итоговый риск
 
-if jq -e . "${QWEN_JSON_FILE}" >/dev/null 2>&1; then
-  jq -r '
-    [.[] | select(.type == "assistant")]
-    | last
-    | .message.content[]?
-    | select(.type == "text")
-    | .text
-  ' "${QWEN_JSON_FILE}" > "${INPUT_OUTPUT_FILE}"
-else
-  echo "Qwen output is not valid JSON, saving raw output"
-  cp "${QWEN_JSON_FILE}" "${INPUT_OUTPUT_FILE}"
-fi
+low / medium / high
 
-if [ ! -s "${INPUT_OUTPUT_FILE}" ]; then
-  echo "Empty parsed review, saving raw output"
-  cp "${QWEN_JSON_FILE}" "${INPUT_OUTPUT_FILE}"
-fi
+Changed files:
 
-echo "== Review generated =="
-cat "${INPUT_OUTPUT_FILE}"
-
-REVIEW_SUMMARY="$(head -n 20 "${INPUT_OUTPUT_FILE}" | tr '\n' ' ' | cut -c1-500)"
-
-{
-  echo "review_file=${INPUT_OUTPUT_FILE}"
-  echo "review_summary=${REVIEW_SUMMARY}"
-} >> "${GITHUB_OUTPUT}"
-
-if [ "${INPUT_POST_COMMENT}" = "true" ]; then
-  echo "== Posting PR comment =="
-
-  if [ -z "${INPUT_PR_NUMBER}" ]; then
-    echo "pr_number is required when post_comment=true" >&2
-    exit 1
-  fi
-
-  if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "GITHUB_TOKEN is required when post_comment=true" >&2
-    exit 1
-  fi
-
-  jq -n --arg body "$(cat "${INPUT_OUTPUT_FILE}")" '{body: $body}' > comment.json
-
-  curl -fsS -X POST \
-    "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${INPUT_PR_NUMBER}/comments" \
-    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-    -H "Accept: application/vnd.github+json" \
-    -H "Content-Type: application/json" \
-    --data @comment.json
-fi
+```text
+{changed_files}
