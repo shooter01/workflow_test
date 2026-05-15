@@ -172,7 +172,11 @@ Changed files:
 {changed_files}
 ----- CHANGED FILES END -----
 
-{DIFF_SECTION_PLACEHOLDER}
+Diff:
+
+----- DIFF START -----
+{diff}
+----- DIFF END -----
 """
 
 Path("qwen-prompt.md").write_text(prompt, encoding="utf-8")
