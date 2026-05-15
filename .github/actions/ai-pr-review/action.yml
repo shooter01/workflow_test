@@ -1,52 +1,66 @@
-name: "AI PR Review"
-description: "Run Qwen Code over PR diff and generate review"
+name: "Qwen PR Review"
+description: "Run Qwen Code against PR diff and optionally post GitHub PR comment"
 
 inputs:
-  openai_api_key:
-    description: "API key for Qwen/OpenAI-compatible provider"
+  diff_file:
+    description: "Path to PR diff file"
     required: true
 
-  openai_base_url:
-    description: "OpenAI-compatible API base URL"
+  changed_files_file:
+    description: "Path to changed files list"
     required: false
-    default: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    default: "changed-files.txt"
 
-  openai_model:
-    description: "Model name"
+  output_file:
+    description: "Path to generated review markdown"
     required: false
-    default: "qwen-coder-plus-latest"
+    default: "qwen-review.md"
+
+  repository:
+    description: "Repository in owner/repo format"
+    required: true
+
+  pr_number:
+    description: "Pull request number"
+    required: true
+
+  base_ref:
+    description: "Base branch"
+    required: false
+    default: ""
+
+  head_ref:
+    description: "Head branch"
+    required: false
+    default: ""
 
   qwen_cli_version:
     description: "Qwen Code CLI version"
     required: false
     default: "latest"
 
-  prompt:
-    description: "Custom review prompt"
+  model_id:
+    description: "Yandex AI Studio model id"
     required: false
-    default: ""
+    default: "gpt://b1g0fdc0s8egb0178g1n/qwen3-235b-a22b-fp8/latest"
 
-  diff_file:
-    description: "Path to PR diff file"
-    required: true
-
-  output_file:
-    description: "Path to generated review markdown"
+  base_url:
+    description: "OpenAI-compatible API base URL"
     required: false
-    default: "review.md"
+    default: "https://llm.api.cloud.yandex.net/v1"
 
-  run_tests:
-    description: "Run go test ./..."
+  run_go_checks:
+    description: "Ask Qwen to run go test ./... and go vet ./..."
     required: false
-    default: "false"
+    default: "true"
 
   post_comment:
-    description: "Post review as PR comment"
+    description: "Post review as GitHub PR comment"
     required: false
     default: "false"
 
-  pr_number:
-    description: "Pull request number"
+  extra_prompt:
+    description: "Additional custom instructions"
     required: false
     default: ""
 
@@ -65,22 +79,36 @@ runs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: "20"
+        node-version: 22
 
-    - name: Run AI PR Review
+    - name: Install Qwen Code
+      shell: bash
+      env:
+        INPUT_QWEN_CLI_VERSION: ${{ inputs.qwen_cli_version }}
+      run: |
+        set -euo pipefail
+        npm install -g "@qwen-code/qwen-code@${INPUT_QWEN_CLI_VERSION}"
+        qwen --version
+
+    - name: Run Qwen PR Review
       id: run
       shell: bash
       env:
-        INPUT_OPENAI_API_KEY: ${{ inputs.openai_api_key }}
-        INPUT_OPENAI_BASE_URL: ${{ inputs.openai_base_url }}
-        INPUT_OPENAI_MODEL: ${{ inputs.openai_model }}
-        INPUT_QWEN_CLI_VERSION: ${{ inputs.qwen_cli_version }}
-        INPUT_PROMPT: ${{ inputs.prompt }}
         INPUT_DIFF_FILE: ${{ inputs.diff_file }}
+        INPUT_CHANGED_FILES_FILE: ${{ inputs.changed_files_file }}
         INPUT_OUTPUT_FILE: ${{ inputs.output_file }}
-        INPUT_RUN_TESTS: ${{ inputs.run_tests }}
-        INPUT_POST_COMMENT: ${{ inputs.post_comment }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
         INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        INPUT_BASE_REF: ${{ inputs.base_ref }}
+        INPUT_HEAD_REF: ${{ inputs.head_ref }}
+        INPUT_MODEL_ID: ${{ inputs.model_id }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        INPUT_RUN_GO_CHECKS: ${{ inputs.run_go_checks }}
+        INPUT_POST_COMMENT: ${{ inputs.post_comment }}
+        INPUT_EXTRA_PROMPT: ${{ inputs.extra_prompt }}
+
+        YANDEX_API_KEY: ${{ env.YANDEX_API_KEY }}
+        GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
       run: |
         chmod +x "${{ github.action_path }}/run.sh"
         "${{ github.action_path }}/run.sh"
