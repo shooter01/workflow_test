@@ -1,0 +1,104 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare diff
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "Repository: ${GITHUB_REPOSITORY}"
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+            echo "Base SHA: ${BASE_SHA}"
+            echo "Head SHA: ${HEAD_SHA}"
+
+            git fetch origin "${BASE_SHA}" --depth=1
+            git fetch origin "${HEAD_SHA}" --depth=1
+
+            git diff "${BASE_SHA}" "${HEAD_SHA}" > pr.diff
+          else
+            echo "workflow_dispatch fallback: diff HEAD~1..HEAD"
+            git diff HEAD~1 HEAD > pr.diff || true
+          fi
+
+          echo "Diff size:"
+          wc -c pr.diff || true
+
+          echo "Diff preview:"
+          head -n 80 pr.diff || true
+
+          echo "diff_file=pr.diff" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        id: prompt
+        shell: bash
+        run: |
+          cat > prompt.txt <<'EOF'
+          Проверь PR diff как senior reviewer.
+
+          Особое внимание:
+          - реальные баги;
+          - безопасность;
+          - обработка ошибок;
+          - совместимость API;
+          - тесты;
+          - edge cases.
+
+          Не переписывай весь код.
+          Не придумывай проблемы.
+          Если всё нормально — напиши коротко, что блокирующих замечаний нет.
+
+          Ответ дай как markdown-комментарий для Pull Request.
+          EOF
+
+          {
+            echo "prompt<<EOF"
+            cat prompt.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run AI PR Review
+        uses: ./.github/actions/ai-pr-review
+        with:
+          openai_api_key: ${{ secrets.QWEN_API_KEY }}
+          openai_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+          openai_model: "qwen-coder-plus-latest"
+          qwen_cli_version: "latest"
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          diff_file: ${{ steps.diff.outputs.diff_file }}
+          output_file: "review.md"
+          run_tests: "false"
+          post_comment: "false"
+          pr_number: ${{ github.event.pull_request.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print review
+        shell: bash
+        run: |
+          echo "== review.md =="
+          cat review.md
