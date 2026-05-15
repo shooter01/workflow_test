@@ -95,13 +95,16 @@ if changed_files_file and Path(changed_files_file).exists():
 else:
     changed_files = "changed-files.txt not found."
 
-go_checks_text = """
+if run_go_checks == "true":
+    go_checks_text = """
 6. Запусти проверки:
    - go test ./...
    - go vet ./...
    Если команда не может быть выполнена, объясни почему.
 7. Сравни вывод CLI-команд с анализом diff.
-""" if run_go_checks == "true" else """
+"""
+else:
+    go_checks_text = """
 6. Go-проверки не запускай, если явно не нужно для анализа.
 """
 
@@ -165,5 +168,95 @@ low / medium / high
 
 Changed files:
 
-```text
+----- CHANGED FILES START -----
 {changed_files}
+----- CHANGED FILES END -----
+
+{DIFF_SECTION_PLACEHOLDER}
+"""
+
+Path("qwen-prompt.md").write_text(prompt, encoding="utf-8")
+PY
+
+echo "Prompt size:"
+wc -c qwen-prompt.md || true
+
+echo "Prompt preview:"
+sed -n '1,120p' qwen-prompt.md || true
+
+echo "== Run Qwen Code =="
+
+set +e
+
+cat qwen-prompt.md | qwen \
+  --prompt \
+  --approval-mode=yolo \
+  --append-system-prompt "You are running in GitHub Actions CI. Use CLI tools to inspect the repository, read files, run git commands, and run Go checks if requested. Do not modify files. Do not commit. Do not push." \
+  > "${INPUT_OUTPUT_FILE}" \
+  2> qwen-stderr.log
+
+QWEN_EXIT_CODE=$?
+
+set -e
+
+if [ "${QWEN_EXIT_CODE}" -ne 0 ]; then
+  echo "Qwen failed with exit code ${QWEN_EXIT_CODE}" >&2
+  echo "== Qwen stderr =="
+  cat qwen-stderr.log || true
+  exit "${QWEN_EXIT_CODE}"
+fi
+
+echo "== Check whether Qwen modified tracked files =="
+
+if ! git diff --quiet; then
+  echo "::warning::Qwen modified tracked files. Reverting tracked changes."
+  git diff --name-status || true
+  git checkout -- .
+fi
+
+echo "== Qwen review =="
+cat "${INPUT_OUTPUT_FILE}"
+
+REVIEW_SUMMARY="$(head -n 20 "${INPUT_OUTPUT_FILE}" | tr '\n' ' ' | cut -c1-500)"
+
+{
+  echo "review_file=${INPUT_OUTPUT_FILE}"
+  echo "review_summary=${REVIEW_SUMMARY}"
+} >> "${GITHUB_OUTPUT}"
+
+if [ "${INPUT_POST_COMMENT}" = "true" ]; then
+  echo "== Post review comment to GitHub PR =="
+
+  if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "GITHUB_TOKEN is required when post_comment=true" >&2
+    exit 1
+  fi
+
+  if [ -z "${INPUT_PR_NUMBER}" ]; then
+    echo "pr_number is required when post_comment=true" >&2
+    exit 1
+  fi
+
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+review_file = os.environ["INPUT_OUTPUT_FILE"]
+body = Path(review_file).read_text(encoding="utf-8", errors="replace")
+
+Path("comment.json").write_text(
+    json.dumps({"body": body}, ensure_ascii=False),
+    encoding="utf-8",
+)
+PY
+
+  curl -fsS -X POST \
+    "https://api.github.com/repos/${INPUT_REPOSITORY}/issues/${INPUT_PR_NUMBER}/comments" \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    --data @comment.json
+
+  echo "Comment posted."
+fi
